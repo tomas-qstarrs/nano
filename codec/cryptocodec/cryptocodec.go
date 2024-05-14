@@ -1,0 +1,311 @@
+package cryptocodec
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"log"
+	"sync/atomic"
+
+	"github.com/tomas-qstarrs/nano/codec"
+	"github.com/tomas-qstarrs/nano/env"
+	"github.com/tomas-qstarrs/nano/message"
+	"github.com/tomas-qstarrs/nano/packet"
+)
+
+const (
+	HeadLength    = 4
+	MaxPacketSize = 64 * 1024 * 1024
+)
+
+const (
+	msgTypeMask             = 0x03 // 0000 0011
+	msgExtensionMask        = 0x04 // 0000 0100
+	msgRouteNotCompressMask = 0x08 // 0000 1000
+	msgBranchMask           = 0x30 // 0011 0000
+	msgDataTypeMask         = 0xC0 // 1100 0000
+	msgHeadLength           = 0x02
+)
+
+var (
+	ErrPacketSizeExcced   = errors.New("codec: packet size exceed")
+	ErrWrongMessageType   = errors.New("codec: wrong message type")
+	ErrInvalidMessage     = errors.New("codec: invalid message")
+	ErrInvalidRouteLength = errors.New("codec: invalid route length")
+)
+
+type CodecEntity struct {
+	crypto     *Crypto
+	dictionary message.Dictionary
+	writeBuf   *bytes.Buffer
+	readBuf    *bytes.Buffer
+	size       int          // last packet length
+	compressed *atomic.Bool // whether to use compressed msg to client
+	extension  *atomic.Bool // whether to use extension
+}
+
+func NewCodecEntity(dictionary message.Dictionary, method Method, key []byte) *CodecEntity {
+	crypto, err := NewCrypto(method, key)
+	if err != nil {
+		log.Panic(err)
+	}
+	return &CodecEntity{
+		crypto:     crypto,
+		writeBuf:   bytes.NewBuffer(nil),
+		readBuf:    bytes.NewBuffer(nil),
+		size:       -1,
+		dictionary: dictionary,
+		compressed: &atomic.Bool{},
+		extension:  &atomic.Bool{},
+	}
+}
+
+func (c *CodecEntity) String() string {
+	return "cryptocodec"
+}
+
+func (c *CodecEntity) EncodePacket(packets []*packet.Packet) ([]byte, error) {
+	var length int
+	for _, p := range packets {
+		err := binary.Write(c.writeBuf, binary.BigEndian, uint32(p.Length))
+		if err != nil {
+			return nil, err
+		}
+		length += 4
+		c.writeBuf.Write(p.Data)
+		length += len(p.Data)
+	}
+	data := c.writeBuf.Next(length)
+
+	copyData := make([]byte, len(data))
+	copy(copyData, data)
+
+	return copyData, nil
+}
+
+func (c *CodecEntity) DecodePacket(data []byte) ([]*packet.Packet, error) {
+	forward := func() error {
+		header := c.readBuf.Next(HeadLength)
+		c.size = int(binary.BigEndian.Uint32(header))
+
+		// packet length limitation
+		if env.Safe && c.size > MaxPacketSize {
+			return fmt.Errorf("%w, size:%d", ErrPacketSizeExcced, c.size)
+		}
+
+		return nil
+	}
+
+	var (
+		packets []*packet.Packet
+		err     error
+	)
+
+	c.readBuf.Write(data)
+
+	// check length
+	if c.readBuf.Len() < HeadLength {
+		return nil, err
+	}
+
+	if c.size < 0 {
+		if err = forward(); err != nil {
+			return nil, err
+		}
+	}
+
+	for c.size <= c.readBuf.Len() {
+		p := &packet.Packet{Length: c.size, Data: c.readBuf.Next(c.size)}
+		packets = append(packets, p)
+
+		// more packet
+		if c.readBuf.Len() < HeadLength {
+			c.size = -1
+			break
+		}
+
+		if err = forward(); err != nil {
+			return nil, err
+		}
+	}
+
+	return packets, nil
+}
+
+func (c *CodecEntity) EncodeMessage(m *message.Message) ([]byte, error) {
+	if !m.TypeValid() {
+		return nil, ErrWrongMessageType
+	}
+	var offset uint64 = 0
+	buf := make([]byte, 27)
+
+	// encode flag
+	flag := byte(m.Type)
+	code, err := c.dictionary.IndexRoute(m.Route)
+	compressed := c.compressed.Load() && err == nil
+	if !compressed {
+		flag |= msgRouteNotCompressMask
+	}
+
+	if c.extension.Load() {
+		flag |= msgExtensionMask
+	}
+
+	flag |= byte(m.Branch) << 4
+	flag |= byte(m.DataType) << 6
+
+	buf[offset] = flag
+	offset++
+
+	// encode version ID
+	binary.BigEndian.PutUint32(buf[offset:], m.ShortVer)
+	offset += 4
+
+	// encode msg ID
+	binary.BigEndian.PutUint64(buf[offset:], m.ID)
+	offset += 8
+
+	// encode unix time
+	binary.BigEndian.PutUint32(buf[offset:], m.UnixTime)
+	offset += 4
+
+	// encode session ID
+	binary.BigEndian.PutUint64(buf[offset:], m.SessionID)
+	offset += 8
+
+	// encode route
+	if compressed {
+		// encode compressed route ID
+		binary.BigEndian.PutUint16(buf[offset:], uint16(code))
+	} else {
+		rl := uint16(len(m.Route))
+
+		// encode route string length
+		binary.BigEndian.PutUint16(buf[offset:], rl)
+
+		// encode route string
+		buf = append(buf, []byte(m.Route)...)
+	}
+
+	if c.extension.Load() {
+		var extBuf = make([]byte, 32)
+		var extOffset uint64 = 0
+
+		binary.BigEndian.PutUint32(extBuf[extOffset:], m.Branch)
+		extOffset += 4
+
+		binary.BigEndian.PutUint32(extBuf[extOffset:], m.DataType)
+
+		buf = append(buf, extBuf...)
+	}
+
+	buf = append(buf, m.Data...)
+
+	return c.crypto.Encode(buf)
+}
+
+func (c *CodecEntity) DecodeMessage(data []byte) (*message.Message, error) {
+	data, err := c.crypto.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(data) < msgHeadLength {
+		return nil, ErrInvalidMessage
+	}
+	var offset uint64 = 0
+
+	// decode flag
+	m := message.New()
+	flag := data[offset]
+	offset++
+	m.Type = message.Type(flag & msgTypeMask)
+
+	c.extension.Store(flag&msgExtensionMask != 0)
+	c.compressed.Store(flag&msgRouteNotCompressMask == 0)
+	m.Branch = uint32((flag & msgBranchMask) >> 4)
+	m.DataType = uint32((flag & msgDataTypeMask) >> 6)
+
+	// decode version ID
+	m.ShortVer = binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+
+	// decode msg ID
+	m.ID = binary.BigEndian.Uint64(data[offset:])
+	offset += 8
+
+	// decode unix time
+	m.UnixTime = binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+
+	// decode session id
+	m.SessionID = binary.BigEndian.Uint64(data[offset:])
+	offset += 8
+
+	// decode route
+	if c.compressed.Load() {
+		// decode compressed route ID
+		code := binary.BigEndian.Uint16(data[offset:])
+		route, err := c.dictionary.IndexCode(uint32(code))
+		if err != nil {
+			return nil, err
+		}
+		m.Route = route
+		offset += 2
+	} else {
+		// decode route string length
+		rl := binary.BigEndian.Uint16(data[offset:])
+		offset += 2
+
+		if offset+uint64(rl) > uint64(len(data)) {
+			return nil, ErrInvalidRouteLength
+		}
+
+		// decode route string
+		m.Route = string(data[offset:(offset + uint64(rl))])
+		offset += uint64(rl)
+	}
+
+	if c.extension.Load() {
+		// Read long branch
+		m.Branch = binary.BigEndian.Uint32(data[offset:])
+		offset += 4
+
+		// Read long data type
+		m.DataType = binary.BigEndian.Uint32(data[offset:])
+		offset += 4
+
+		offset += 24
+	}
+
+	m.Data = data[offset:]
+
+	return m, nil
+}
+
+type Codec struct {
+	method    Method
+	base64Key string
+}
+
+func NewCodec(method Method, base64Key string) *Codec {
+	return &Codec{
+		method:    method,
+		base64Key: base64Key,
+	}
+}
+
+func (c *Codec) Entity(dictionary message.Dictionary) codec.CodecEntity {
+	if dictionary == nil {
+		dictionary = message.EmptyDictionary
+	}
+
+	key, err := base64.StdEncoding.DecodeString(c.base64Key)
+	if err != nil {
+		panic(err)
+	}
+
+	return NewCodecEntity(dictionary, c.method, key)
+}
